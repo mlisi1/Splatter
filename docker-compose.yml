@@ -1,0 +1,23 @@
+services:
+  splatter:
+    build: .
+    image: splatter:latest
+    ipc: host
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ./pipeline.py:/workspace/pipeline.py
+      - ./splatter:/workspace/splatter
+      - ./entry_script.sh:/usr/local/bin/entry_script.sh
+      - ./data/input:/data/input:ro      # put videos, PLY files, extrinsics here
+      - ./data/output:/data/output       # pipeline writes here
+      - dav2_weights:/cache/.cache/depth_anything_v2  # model weights survive restarts
+
+volumes:
+  dav2_weights:

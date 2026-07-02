@@ -1,0 +1,12 @@
+torch>=2.1
+torchvision
+numpy
+open3d>=0.18
+opencv-python
+Pillow
+tqdm
+transformers>=4.37
+git+https://github.com/cvg/Hierarchical-Localization.git
+# Depth Anything V2 is not pip-installable — clone manually:
+# git clone https://github.com/DepthAnything/Depth-Anything-V2.git /opt/depth-anything-v2
+# export PYTHONPATH="/opt/depth-anything-v2:$PYTHONPATH"
