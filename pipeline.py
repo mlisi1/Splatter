@@ -10,7 +10,7 @@ import numpy as np
 
 from splatter.io.colmap import read_model
 from splatter.io.ply import write_ply
-from splatter.stages import densification, extraction, features, sfm
+from splatter.stages import densification, extraction, features, sfm, undistort
 from splatter.utils.logging import setup_logging
 from splatter import report as report_gen
 
@@ -28,6 +28,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lidar", type=Path, default=None, help="LiDAR PLY file")
     p.add_argument("--extrinsics", type=Path, default=None,
                    help="T_cam_to_lidar 4×4 plain-text matrix")
+    p.add_argument("--calibration", type=Path, default=None,
+                   help="Known camera calibration file (model, WxH, params — see CLAUDE.md). "
+                        "If supplied, frames are undistorted right after extraction using "
+                        "this calibration instead of relying on COLMAP self-calibration.")
     p.add_argument("--output", type=Path, default=Path("./output"), help="Output directory")
     p.add_argument("--fps", type=float, default=None,
                    help="Frame extraction rate (default: 5)")
@@ -218,6 +222,11 @@ def main() -> None:
         frames = extraction.filter_blurry_frames(frames, args.iqa_threshold)
         stats["frames_after_iqa"] = len(frames)
 
+    # ---- Stage 1.5: Known-calibration undistortion (optional) --------------
+    if args.calibration is not None:
+        logger.info("\n=== Stage 1.5: Known-calibration undistortion ===")
+        undistort.undistort_known_calibration(output_dir / "images", args.calibration, output_dir)
+
     # ---- Stage 2: Feature Extraction and Matching --------------------------
     logger.info("\n=== Stage 2: Feature Extraction and Matching ===")
     feature_path, match_path, pairs_path = features.run_hloc(output_dir, args.matcher)
@@ -251,6 +260,10 @@ def main() -> None:
         sparse_points=sfm_stats["n_points"],
         mean_reproj=sfm_stats["mean_reproj"],
     )
+
+    # ---- Stage 3.5: Undistortion --------------------------------------------
+    logger.info("\n=== Stage 3.5: Undistortion ===")
+    undistort.undistort_images(output_dir, sparse_0)
 
     # ---- Stage 4: Densification --------------------------------------------
     depth_dir = output_dir / "depth"
