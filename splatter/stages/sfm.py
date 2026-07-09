@@ -38,6 +38,7 @@ def run_sfm(
 
     hloc_ok = False
     try:
+        import pycolmap
         from hloc import reconstruction as hloc_recon
         logger.info("Running hloc reconstruction (feature import + COLMAP mapper)")
         hloc_recon.main(
@@ -46,6 +47,7 @@ def run_sfm(
             pairs=pairs_path,
             features=feature_path,
             matches=match_path,
+            camera_mode=pycolmap.CameraMode.SINGLE,
         )
         # hloc writes the largest model directly into sfm_dir (not sfm_dir/0/).
         # Detect this layout and normalise to sparse/0/.
