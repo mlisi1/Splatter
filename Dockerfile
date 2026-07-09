@@ -18,8 +18,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libceres-dev libopenimageio-dev openimageio-tools libopencv-dev \
     # Pipeline runtime deps
     ffmpeg \
+    perl \
     libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
+
+# ExifTool — installed from upstream instead of apt's libimage-exiftool-perl,
+# which on Ubuntu 24.04 is pinned to 12.76. Stage 3.6's telemetry georegistration
+# needs 13.0+: that's when DJI's protobuf-encoded "djmd" video metadata track
+# (used by current-gen drones and Osmo Action cameras) was added to exiftool's
+# DJI module — an older exiftool runs without error but silently decodes zero
+# GPS samples from that track. Pure Perl, no build step; only needs `perl` above.
+RUN wget -q -O /tmp/exiftool.tar.gz \
+        "https://sourceforge.net/projects/exiftool/files/Image-ExifTool-13.59.tar.gz/download" \
+    && tar xzf /tmp/exiftool.tar.gz -C /opt \
+    && ln -s /opt/Image-ExifTool-13.59/exiftool /usr/local/bin/exiftool \
+    && rm /tmp/exiftool.tar.gz
 
 # ---- Build COLMAP from source (CUDA 12.8, sm_120 for RTX 5070) ------------
 RUN git clone --recursive --depth 1 https://github.com/colmap/colmap.git /opt/colmap-src

@@ -1,0 +1,27 @@
+#------------------------------------------------------------------------------
+# File:         _telemetry_gpx.fmt
+#
+# Inlined copy of exiftool's own bundled gpx.fmt recipe (normally shipped at
+# /usr/share/doc/libimage-exiftool-perl/fmt_files/gpx.fmt on Debian/Ubuntu).
+# Kept alongside the pipeline source rather than relied upon at that path
+# since minimal/doc-stripped container images may not ship /usr/share/doc.
+#
+# Usage:        exiftool -ee3 -p _telemetry_gpx.fmt VIDEO_FILE
+#------------------------------------------------------------------------------
+#[HEAD]<?xml version="1.0" encoding="utf-8"?>
+#[HEAD]<gpx version="1.0"
+#[HEAD] creator="ExifTool $ExifToolVersion"
+#[HEAD] xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+#[HEAD] xmlns="http://www.topografix.com/GPX/1/0"
+#[HEAD] xsi:schemaLocation="http://www.topografix.com/GPX/1/0 http://www.topografix.com/GPX/1/0/gpx.xsd">
+#[HEAD]<trk>
+#[HEAD]<number>1</number>
+#[HEAD]<trkseg>
+#[IF]  $gpslatitude $gpslongitude
+#[BODY]<trkpt lat="$gpslatitude#" lon="$gpslongitude#">
+#[BODY]  <ele>$gpsaltitude#</ele>
+#[BODY]  <time>${gpsdatetime#;my ($ss)=/\.\d+/g;DateFmt("%Y-%m-%dT%H:%M:%SZ");s/Z/${ss}Z/ if $ss}</time>
+#[BODY]</trkpt>
+#[TAIL]</trkseg>
+#[TAIL]</trk>
+#[TAIL]</gpx>

@@ -10,7 +10,7 @@ import numpy as np
 
 from splatter.io.colmap import read_model
 from splatter.io.ply import write_ply
-from splatter.stages import densification, extraction, features, sfm, undistort
+from splatter.stages import densification, extraction, features, sfm, telemetry, undistort
 from splatter.utils.logging import setup_logging
 from splatter import report as report_gen
 
@@ -32,6 +32,14 @@ def parse_args() -> argparse.Namespace:
                    help="Known camera calibration file (model, WxH, params — see CLAUDE.md). "
                         "If supplied, frames are undistorted right after extraction using "
                         "this calibration instead of relying on COLMAP self-calibration.")
+    p.add_argument("--telemetry", choices=["auto", "dji", "embedded", "off"], default="auto",
+                   help="Georegister the reconstruction to real-world metric scale using GPS "
+                        "telemetry embedded in the video: a DJI SRT sidecar, or an embedded GPS "
+                        "track decoded via exiftool (GoPro GPMF, DJI's newer protobuf djmd "
+                        "track used by drones/Osmo Action, Garmin VIRB, Insta360, etc.). "
+                        "'auto' detects whichever is present; 'off' disables this stage. "
+                        "Ignored (skipped) when --lidar is supplied — LiDAR already provides "
+                        "metric scale.")
     p.add_argument("--output", type=Path, default=Path("./output"), help="Output directory")
     p.add_argument("--fps", type=float, default=None,
                    help="Frame extraction rate (default: 5)")
@@ -129,6 +137,7 @@ def print_summary(stats: dict, output_dir: Path, elapsed: float, logger) -> None
         f"\n Frames after IQA filter: {n_iqa:,}"
         f"\n Frames registered      : {n_reg:,}  ({reg_pct:.1f}%)"
         f"\n Sparse points (SfM)    : {stats['sparse_points']:,}"
+        f"\n Georegistration        : {stats['georegistration']}"
         f"\n Densification branch   : {stats['densification_branch']}"
         f"\n Densified points       : {stats['densified_points']:,}"
         f"\n Mean reprojection error: {stats['mean_reproj']:.2f} px"
@@ -201,7 +210,7 @@ def main() -> None:
     stats = dict(
         frames_extracted=0, frames_after_iqa=0, frames_registered=0,
         sparse_points=0, densified_points=0, mean_reproj=0.0,
-        densification_branch="None",
+        densification_branch="None", georegistration="None",
     )
 
     # ---- Stage 1: Frame Extraction ----------------------------------------
@@ -264,6 +273,19 @@ def main() -> None:
     # ---- Stage 3.5: Undistortion --------------------------------------------
     logger.info("\n=== Stage 3.5: Undistortion ===")
     undistort.undistort_images(output_dir, sparse_0)
+
+    # ---- Stage 3.6: Georegistration from telemetry (optional) --------------
+    if args.lidar is not None:
+        if args.telemetry != "off":
+            logger.info(
+                "\n=== Stage 3.6: Georegistration (telemetry) ===\n"
+                "Skipping — --lidar already provides metric scale"
+            )
+    else:
+        logger.info("\n=== Stage 3.6: Georegistration (telemetry) ===")
+        telemetry_source = telemetry.run(output_dir, sparse_0, args.video, fps, mode=args.telemetry)
+        if telemetry_source:
+            stats["georegistration"] = telemetry_source
 
     # ---- Stage 4: Densification --------------------------------------------
     depth_dir = output_dir / "depth"

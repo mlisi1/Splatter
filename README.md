@@ -12,6 +12,8 @@ Converts a video file (plus optional LiDAR point cloud) into a **COLMAP sparse r
 - [Usage examples](#usage-examples)
 - [All flags](#all-flags)
 - [Extrinsics file format](#extrinsics-file-format)
+- [Calibration file format](#calibration-file-format)
+- [Telemetry georegistration](#telemetry-georegistration)
 - [Output structure](#output-structure)
 - [Training GS models](#training-gs-models)
 - [Project layout](#project-layout)
@@ -23,10 +25,15 @@ Converts a video file (plus optional LiDAR point cloud) into a **COLMAP sparse r
 | # | Stage | Tool |
 |---|-------|------|
 | 1 | Frame extraction + blur filter | FFmpeg + Laplacian IQA |
+| 1.5 | Known-calibration undistortion (optional) | OpenCV, if `--calibration` is supplied |
 | 2 | Feature extraction + matching | hloc (DISK/ALIKED + LightGlue + NetVLAD) |
 | 3 | Structure-from-Motion | COLMAP (global → hierarchical → incremental fallback) |
+| 3.5 | Undistortion | COLMAP `image_undistorter` (self-calibrated model → PINHOLE) |
+| 3.6 | Telemetry georegistration (optional) | COLMAP `model_aligner`, from DJI SRT sidecar or exiftool-decoded embedded GPS |
 | 4A | Densification — images only | Depth Anything V2 anchored to SfM sparse cloud |
 | 4B | Densification — LiDAR fusion | LiDAR metric scale + Depth Anything V2 infill |
+
+See `docs/PIPELINE.md` for a full walkthrough of what each stage does and why.
 
 The final output is written to `gs_dataset/` — a text-format COLMAP dataset that all major GS trainers accept without conversion.
 
@@ -74,6 +81,13 @@ docker compose exec splatter entry_script.sh \
   --lidar /data/input/scan.ply \
   --extrinsics /data/input/cam_to_lidar.txt \
   --output /data/output
+
+# DJI/GoPro footage with embedded GPS telemetry — auto-detected, georegisters
+# the reconstruction to real-world metric scale without needing LiDAR.
+# For DJI, drop the matching DJI_0001.SRT sidecar into data/input/ alongside the video.
+docker compose exec splatter entry_script.sh \
+  --video /data/input/DJI_0001.MP4 \
+  --output /data/output
 ```
 
 Output lands in `data/output/` on your host. Depth Anything V2 weights (~0.3–1.3 GB) are stored in a named Docker volume and reused across runs.
@@ -89,6 +103,7 @@ docker compose down   # stop the container when done
 ```bash
 # System dependencies
 sudo apt install ffmpeg colmap   # COLMAP ≥ 4.0 required
+sudo apt install perl   # Ubuntu's exiftool package is too old for DJI GPS support — install exiftool ≥ 13.0 manually (see CLAUDE.md), optional, only needed for embedded-track telemetry georegistration
 
 # Python dependencies
 pip install -r requirements.txt
@@ -121,6 +136,25 @@ python pipeline.py \
   --video mission.mp4 \
   --lidar scan.ply \
   --extrinsics cam_to_lidar.txt \
+  --output ./output
+
+# With a known camera calibration — skips COLMAP self-calibration, undistorts
+# right after extraction instead of only before densification
+python pipeline.py \
+  --video mission.mp4 \
+  --calibration cam_calib.txt \
+  --output ./output
+
+# DJI drone footage with a DJI_0001.SRT sidecar next to the video — auto-detected,
+# georegisters the reconstruction to real-world metric scale without any LiDAR
+python pipeline.py \
+  --video DJI_0001.MP4 \
+  --output ./output
+
+# GoPro (or newer DJI Osmo Action/drone) footage — force the embedded-track path explicitly
+python pipeline.py \
+  --video GX010001.MP4 \
+  --telemetry embedded \
   --output ./output
 
 # ALIKED features — better for low-texture or low-overlap scenes
@@ -169,6 +203,8 @@ python pipeline.py \
 | `--video` | *(required)* | Input video (MP4, MOV, MKV, AVI) |
 | `--lidar` | — | LiDAR point cloud in PLY format (XYZ or XYZI). Enables LiDAR-assisted densification |
 | `--extrinsics` | — | 4×4 `T_cam_to_lidar` matrix (plain text, row-major, metres). If omitted with `--lidar`, identity is assumed and a warning is printed |
+| `--calibration` | — | Known camera calibration file (model, WxH, params). If supplied, frames are undistorted right after extraction (Stage 1.5) instead of relying on COLMAP self-calibration |
+| `--telemetry` | `auto` | `auto`/`dji`/`embedded`/`off` — georegister the reconstruction to real-world metric scale using GPS telemetry embedded in the video (DJI SRT sidecar, or an embedded GPS track decoded via exiftool — GoPro GPMF, DJI's newer protobuf `djmd` track, Garmin VIRB, etc.). Ignored when `--lidar` is supplied |
 | `--output` | `./output` | Output directory |
 | `--device` | `cuda` | Compute device: `cuda` or `cpu` |
 
@@ -228,16 +264,56 @@ Identity example (camera and LiDAR co-located):
 
 ---
 
+## Calibration file format
+
+Plain text, 3 lines: COLMAP camera model (`OPENCV` or `FULL_OPENCV`), the resolution the
+calibration was measured at, then space-separated params in COLMAP order — identical to
+OpenCV's own `cameraMatrix`/`distCoeffs` convention, so no reordering is needed for calibration
+data from `cv2.calibrateCamera`.
+
+```
+OPENCV
+1920 1080
+1200.0 1200.0 960.0 540.0 -0.18 0.05 0.0002 -0.0001
+```
+
+`fx, fy, cx, cy` are scaled automatically to match the actual extracted frame size (so this
+works unchanged with `--resize`); `k1, k2, p1, p2[, k3..]` are resolution-invariant. See
+`CLAUDE.md` for the full param-order reference.
+
+---
+
+## Telemetry georegistration
+
+`--telemetry {auto,dji,embedded,off}` rescales/reorients the reconstruction into real-world ENU
+metres using GPS already embedded in the video — a DJI drone's `<video>.srt` sidecar, or an
+embedded GPS track read via `exiftool` (GoPro GPMF, DJI's newer protobuf `djmd` track used by
+drones/Osmo Action, Garmin VIRB, Insta360, etc.) — instead of relying on `--lidar` to ground the
+otherwise scale-ambiguous monocular reconstruction. `auto` (default) detects whichever is
+present; the stage is always best-effort (a warning and no change to `sparse/0` if telemetry
+can't be found or matched, never a hard failure) and is skipped automatically when `--lidar` is
+supplied. **Requires exiftool ≥ 13.0** for the embedded-track path — see `CLAUDE.md`'s Docker
+deployment notes; Ubuntu's packaged exiftool (12.76) predates DJI protobuf GPS support and will
+silently find nothing on a DJI `djmd` track. See `docs/PIPELINE.md` (Stage 3.6) and `CLAUDE.md`
+for the full mechanics.
+
+---
+
 ## Output structure
 
 ```
 <output>/
-├── images/                     # Extracted and filtered frames (000001.png, …)
+├── images/                     # Undistorted, filtered frames (000001.png, …) — PINHOLE, after Stage 3.5
+├── images_distorted/           # Original distorted frames, kept as a backup by Stage 3.5
 ├── sparse/
-│   └── 0/                      # COLMAP sparse reconstruction (binary)
-│       ├── cameras.bin
-│       ├── images.bin
-│       └── points3D.bin        # Replaced with densified cloud after Stage 4
+│   ├── 0/                      # COLMAP sparse reconstruction (binary), PINHOLE after Stage 3.5
+│   │   ├── cameras.bin
+│   │   ├── images.bin
+│   │   └── points3D.bin        # Replaced with densified cloud after Stage 4
+│   ├── _distorted_backup/      # Pre-undistortion model (OPENCV/RADIAL), kept by Stage 3.5
+│   └── _pre_georegister_backup/ # Pre-alignment model, kept by Stage 3.6 if telemetry georegistration ran
+├── telemetry_ref_images.txt    # image_name lat lon alt used to fit the Stage 3.6 alignment, if it ran
+├── telemetry_transform.txt     # Similarity transform applied by Stage 3.6, if it ran
 ├── sparse_txt/
 │   └── 0/                      # Human-readable text copy of the above
 │       ├── cameras.txt
@@ -290,6 +366,8 @@ splatter/
     ├── extraction.py      # Stage 1: FFmpeg extraction, auto-FPS, IQA blur filter
     ├── features.py        # Stage 2: hloc (DISK/ALIKED + NetVLAD + LightGlue)
     ├── sfm.py             # Stage 3: COLMAP mapper with fallback chain
+    ├── undistort.py       # Stage 1.5 (known calibration) + Stage 3.5 (self-calibrated) undistortion
+    ├── telemetry.py       # Stage 3.6: GPS georegistration from DJI SRT sidecar or exiftool-decoded embedded track
     └── densification.py   # Stage 4: Depth Anything V2, LiDAR fusion, cloud merge
 pipeline.py                # CLI entry point — arg parsing, orchestration, validation, summary
 entry_script.sh            # Docker exec entrypoint wrapper

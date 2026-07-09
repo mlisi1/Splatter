@@ -54,6 +54,7 @@ def _section_summary(stats: dict) -> str:
         ("Frames after IQA filter", f"{stats['frames_after_iqa']:,}"),
         ("Frames registered",       f"{n_reg:,}  ({n_reg / n_iqa:.1%})"),
         ("Sparse points (SfM)",     f"{stats['sparse_points']:,}"),
+        ("Georegistration",         stats.get("georegistration", "None")),
         ("Densification branch",    stats["densification_branch"]),
         ("Densified points",        f"{stats['densified_points']:,}"),
         ("Mean reprojection error", f"{stats['mean_reproj']:.2f} px"),
