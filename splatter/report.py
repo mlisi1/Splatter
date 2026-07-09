@@ -48,11 +48,12 @@ def generate(output_dir: Path, cameras: dict, images: dict,
 
 def _section_summary(stats: dict) -> str:
     n_reg = stats["frames_registered"]
-    n_iqa = max(stats["frames_after_iqa"], 1)
+    n_dedup = max(stats["frames_after_dedup"], 1)
     rows = [
         ("Frames extracted",        f"{stats['frames_extracted']:,}"),
         ("Frames after IQA filter", f"{stats['frames_after_iqa']:,}"),
-        ("Frames registered",       f"{n_reg:,}  ({n_reg / n_iqa:.1%})"),
+        ("Frames after dedup",      f"{stats['frames_after_dedup']:,}"),
+        ("Frames registered",       f"{n_reg:,}  ({n_reg / n_dedup:.1%})"),
         ("Sparse points (SfM)",     f"{stats['sparse_points']:,}"),
         ("Georegistration",         stats.get("georegistration", "None")),
         ("Densification branch",    stats["densification_branch"]),

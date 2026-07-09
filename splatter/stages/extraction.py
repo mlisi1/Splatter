@@ -156,3 +156,53 @@ def filter_blurry_frames(frames: list[Path], threshold: float) -> list[Path]:
 
     logger.info(f"IQA: discarded {n_discard} frames, kept {len(keep)}")
     return keep
+
+
+def filter_duplicate_frames(frames: list[Path], threshold: float, max_gap: int = 15) -> list[Path]:
+    """
+    Greedily walk frames in temporal order and drop a frame if it is
+    near-identical to the most recently *kept* frame, collapsing static
+    holds (e.g. a robot/camera sitting still) down to a handful of frames.
+
+    Each frame is downsampled to 64x64 grayscale and mean-centered (its own
+    per-frame average subtracted) before differencing, so the comparison is
+    on local structure rather than absolute brightness -- this keeps slow
+    auto-exposure/white-balance drift or flicker during a static hold from
+    being misread as a genuinely new viewpoint.
+
+    threshold<=0 keeps everything (default/off). Unlike filter_blurry_frames,
+    there is no batch-wide min-max renormalisation -- the score is always
+    relative to the single last-kept frame, so its meaning doesn't depend
+    on what else is in the batch.
+
+    Guards against slow continuous pans/dollies -- where every consecutive
+    raw frame is individually near-identical to its neighbour but drift
+    accumulates real parallax over many frames -- by always keeping at
+    least one frame out of every `max_gap` consecutive raw frames.
+    """
+    if threshold <= 0 or len(frames) <= 1:
+        return frames
+
+    def _descriptor(path: Path) -> np.ndarray:
+        img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+        small = cv2.resize(img, (64, 64), interpolation=cv2.INTER_AREA).astype(np.float64)
+        return small - small.mean()
+
+    keep = [frames[0]]
+    last_desc = _descriptor(frames[0])
+    since_kept, n_discard = 0, 0
+
+    for f in tqdm(frames[1:], desc="Dedup scoring"):
+        desc = _descriptor(f)
+        score = np.abs(desc - last_desc).mean() / 255.0
+        since_kept += 1
+        if score >= threshold or since_kept >= max_gap:
+            keep.append(f)
+            last_desc = desc
+            since_kept = 0
+        else:
+            f.unlink()
+            n_discard += 1
+
+    logger.info(f"Dedup: discarded {n_discard} frames, kept {len(keep)}")
+    return keep

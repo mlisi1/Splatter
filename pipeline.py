@@ -48,6 +48,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-frames", type=int, default=2000)
     p.add_argument("--iqa-threshold", type=float, default=0.5,
                    help="Blur rejection threshold 0–1 (0 = keep all)")
+    p.add_argument("--dedup-threshold", type=float, default=0.0,
+                   help="Sequential near-duplicate rejection, ~0-1 (0 = off, default). "
+                        "Collapses a run of near-identical frames (e.g. camera/robot "
+                        "sitting still) to a handful by comparing each frame only to "
+                        "the last frame kept -- a later revisit of an earlier viewpoint "
+                        "is unaffected. No universally safe non-zero default: start "
+                        "around 0.02 and increase if static holds still aren't "
+                        "collapsing, decrease (or leave at 0) if a low-texture scene "
+                        "(long corridor, tiled floor) starts losing distinct viewpoints.")
     p.add_argument("--matcher", choices=["disk", "aliked"], default="disk")
     p.add_argument("--sfm", choices=["global", "hierarchical", "incremental"], default="global")
     p.add_argument("--depth-model", choices=["dav2_vitl", "dav2_vitb", "dav2_vits"],
@@ -127,7 +136,8 @@ def print_summary(stats: dict, output_dir: Path, elapsed: float, logger) -> None
     mins, secs = int(elapsed // 60), int(elapsed % 60)
     n_reg = stats["frames_registered"]
     n_iqa = stats["frames_after_iqa"]
-    reg_pct = n_reg / max(n_iqa, 1) * 100
+    n_dedup = stats["frames_after_dedup"]
+    reg_pct = n_reg / max(n_dedup, 1) * 100
 
     msg = (
         "\n========================================"
@@ -135,6 +145,7 @@ def print_summary(stats: dict, output_dir: Path, elapsed: float, logger) -> None
         "\n========================================"
         f"\n Frames extracted       : {stats['frames_extracted']:,}"
         f"\n Frames after IQA filter: {n_iqa:,}"
+        f"\n Frames after dedup     : {n_dedup:,}"
         f"\n Frames registered      : {n_reg:,}  ({reg_pct:.1f}%)"
         f"\n Sparse points (SfM)    : {stats['sparse_points']:,}"
         f"\n Georegistration        : {stats['georegistration']}"
@@ -208,7 +219,7 @@ def main() -> None:
     logger.info(f"  matcher={args.matcher}  sfm={args.sfm}  depth={args.depth_model}")
 
     stats = dict(
-        frames_extracted=0, frames_after_iqa=0, frames_registered=0,
+        frames_extracted=0, frames_after_iqa=0, frames_after_dedup=0, frames_registered=0,
         sparse_points=0, densified_points=0, mean_reproj=0.0,
         densification_branch="None", georegistration="None",
     )
@@ -225,11 +236,14 @@ def main() -> None:
     frames, extraction_skipped = extraction.extract_frames(args.video, output_dir, fps, args.max_frames, args.resize)
     stats["frames_extracted"] = len(frames)
     if extraction_skipped:
-        logger.info("Skipping IQA (frames already filtered by prior run)")
+        logger.info("Skipping IQA + dedup (frames already filtered by prior run)")
         stats["frames_after_iqa"] = len(frames)
+        stats["frames_after_dedup"] = len(frames)
     else:
         frames = extraction.filter_blurry_frames(frames, args.iqa_threshold)
         stats["frames_after_iqa"] = len(frames)
+        frames = extraction.filter_duplicate_frames(frames, args.dedup_threshold)
+        stats["frames_after_dedup"] = len(frames)
 
     # ---- Stage 1.5: Known-calibration undistortion (optional) --------------
     if args.calibration is not None:
@@ -248,7 +262,7 @@ def main() -> None:
         logger.info("\n=== Stage 3: SfM (COLMAP) ===")
         sfm.run_sfm(output_dir, args.sfm, feature_path, match_path, pairs_path)
 
-    sfm_stats = sfm.check_quality(sparse_0, stats["frames_after_iqa"])
+    sfm_stats = sfm.check_quality(sparse_0, stats["frames_after_dedup"])
 
     # If global mapper got < 80% registration, retry with incremental which is
     # more robust for sequential video with poorly-connected sub-trajectories.
@@ -262,7 +276,7 @@ def main() -> None:
             "— retrying with incremental mapper"
         )
         sfm.retry_with_incremental(output_dir)
-        sfm_stats = sfm.check_quality(sparse_0, stats["frames_after_iqa"])
+        sfm_stats = sfm.check_quality(sparse_0, stats["frames_after_dedup"])
 
     stats.update(
         frames_registered=sfm_stats["n_registered"],
