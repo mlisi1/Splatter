@@ -142,8 +142,8 @@ def undistort_images(output_dir: Path, sparse_0: Path) -> None:
         error in the merged point cloud.
 
     Running this before Stage 4 means densification, the PLY export, and
-    gs_dataset/ all operate on already-undistorted images and a PINHOLE
-    camera, with no changes needed downstream.
+    the <name>_dataset/ folder all operate on already-undistorted images and
+    a PINHOLE camera, with no changes needed downstream.
 
     No-op if the model is already PINHOLE/SIMPLE_PINHOLE (undistortion
     already ran on a previous invocation against this output directory).

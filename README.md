@@ -24,10 +24,10 @@ Converts a video file (plus optional LiDAR point cloud) into a **COLMAP sparse r
 
 | # | Stage | Tool |
 |---|-------|------|
-| 1 | Frame extraction + blur filter | FFmpeg + Laplacian IQA |
+| 1 | Frame extraction + blur/dedup filter | FFmpeg + Laplacian IQA + sequential near-duplicate filter |
 | 1.5 | Known-calibration undistortion (optional) | OpenCV, if `--calibration` is supplied |
 | 2 | Feature extraction + matching | hloc (DISK/ALIKED + LightGlue + NetVLAD) |
-| 3 | Structure-from-Motion | COLMAP (global → hierarchical → incremental fallback) |
+| 3 | Structure-from-Motion | COLMAP (global → hierarchical → incremental fallback), single shared camera per video |
 | 3.5 | Undistortion | COLMAP `image_undistorter` (self-calibrated model → PINHOLE) |
 | 3.6 | Telemetry georegistration (optional) | COLMAP `model_aligner`, from DJI SRT sidecar or exiftool-decoded embedded GPS |
 | 4A | Densification — images only | Depth Anything V2 anchored to SfM sparse cloud |
@@ -35,7 +35,9 @@ Converts a video file (plus optional LiDAR point cloud) into a **COLMAP sparse r
 
 See `docs/PIPELINE.md` for a full walkthrough of what each stage does and why.
 
-The final output is written to `gs_dataset/` — a text-format COLMAP dataset that all major GS trainers accept without conversion.
+The final output is written to `<output_dir_name>_dataset/` — a text-format COLMAP dataset (real
+files, not symlinks, so it's safe to copy elsewhere — e.g. to a Jetson — as a self-contained
+folder) that all major GS trainers accept without conversion.
 
 ---
 
@@ -90,7 +92,11 @@ docker compose exec splatter entry_script.sh \
   --output /data/output
 ```
 
-Output lands in `data/output/` on your host. Depth Anything V2 weights (~0.3–1.3 GB) are stored in a named Docker volume and reused across runs.
+Output lands in `data/output/` on your host. Every model checkpoint this pipeline downloads —
+Depth Anything V2 (~0.3–1.3 GB), hloc's NetVLAD/DISK/ALIKED/LightGlue weights, and the SegFormer
+sky-mask model (`--sky-mask`) — is cached in a single named Docker volume (`model_cache`, mounted at
+`/cache/.cache`) and reused across container restarts: only the very first run of each downloads
+anything.
 
 ```bash
 docker compose down   # stop the container when done
@@ -217,6 +223,7 @@ python pipeline.py \
 | `--max-frames` | 2000 | Hard cap on extracted frames |
 | `--resize` | 0 (full res) | Resize frames so the longer edge is this many pixels before any processing |
 | `--iqa-threshold` | 0.5 | Blur rejection threshold: 0 = keep all frames, 1 = keep only the sharpest. **Warning:** 0.5 is very aggressive and can discard 80%+ of frames on outdoor or robot captures. Use 0.2 or lower, or 0 to let SfM reject unregisterable frames naturally |
+| `--dedup-threshold` | 0 (off) | Sequential near-duplicate rejection, ~0–1. Collapses a run of near-identical frames (e.g. a robot/camera sitting still) to a handful by comparing each frame only to the last one kept — a later revisit of an earlier viewpoint is unaffected. No universally safe non-zero default: start around 0.02 |
 
 ### Feature matching & SfM
 
@@ -303,7 +310,7 @@ for the full mechanics.
 
 ```
 <output>/
-├── images/                     # Undistorted, filtered frames (000001.png, …) — PINHOLE, after Stage 3.5
+├── images -> <name>_dataset/images  # Relative symlink; real files live in <name>_dataset/ (see below)
 ├── images_distorted/           # Original distorted frames, kept as a backup by Stage 3.5
 ├── sparse/
 │   ├── 0/                      # COLMAP sparse reconstruction (binary), PINHOLE after Stage 3.5
@@ -319,8 +326,11 @@ for the full mechanics.
 │       ├── cameras.txt
 │       ├── images.txt
 │       └── points3D.txt
-├── gs_dataset/                 # Ready-to-train COLMAP dataset — point trainers here
-│   ├── images -> ../images     # Symlink (no frame duplication)
+├── <name>_dataset/              # Ready-to-train COLMAP dataset, named after the output dir itself
+│   │                             # (e.g. --output ./output/crosslab1 → crosslab1_dataset/) — point
+│   │                             # trainers here; every file inside is real (no symlinks), so this
+│   │                             # folder alone is safe to copy elsewhere (e.g. to a Jetson)
+│   ├── images/                  # Real directory, moved (not copied) from <output>/images/
 │   └── sparse/
 │       └── 0/
 │           ├── cameras.txt
@@ -330,25 +340,28 @@ for the full mechanics.
 │   └── 000001.npy, …
 ├── points3D.ply                # Full densified cloud with RGB (CloudCompare / MeshLab)
 ├── report.html                 # Self-contained HTML run report
+├── config.json                 # CLI args used for this run + frames_extracted/after_iqa/after_dedup counts
 ├── database.db                 # COLMAP feature database
-└── pipeline.log                # Full run log with parameters and timing
+└── pipeline.log                # Full run log with parameters and timing (ends with total elapsed time)
 ```
 
 ---
 
 ## Training GS models
 
-Point trainers at `gs_dataset/` — it contains the text-format COLMAP files all major frameworks accept:
+Point trainers at `<output>/<name>_dataset/` (e.g. `./output/crosslab1/crosslab1_dataset/`) — it
+contains the text-format COLMAP files all major frameworks accept, with real (non-symlinked) image
+files, so the folder is also what you'd `scp`/`rsync` to a training box (e.g. a Jetson):
 
 ```bash
 # 2DGS / original 3DGS (INRIA)
-python train.py -s ./output/gs_dataset
+python train.py -s ./output/crosslab1/crosslab1_dataset
 
 # gsplat / Nerfstudio
-ns-train splatfacto --data ./output/gs_dataset
+ns-train splatfacto --data ./output/crosslab1/crosslab1_dataset
 
 # OpenSplat
-opensplat ./output/gs_dataset -n 30000
+opensplat ./output/crosslab1/crosslab1_dataset -n 30000
 ```
 
 ---

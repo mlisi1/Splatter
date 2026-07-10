@@ -540,11 +540,15 @@ def _merge_and_downsample(
     pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
     pcd.colors = o3d.utility.Vector3dVector(cols.astype(np.float64) / 255.0)
 
-    # Initial voxel downsample — increase size until under 10M points
+    # Initial voxel downsample — increase size until under the safety cap.
+    # The cap is the larger of 10M and the user's own --max-points target, so
+    # a user-requested target above 10M (e.g. --max-points 15000000) isn't
+    # silently overridden by escalating voxel size past what they actually need.
+    safety_cap = max(max_points, 10_000_000)
     for v in (voxel_size, voxel_size * 1.5, voxel_size * 2.5):
         pcd = pcd.voxel_down_sample(v)
         logger.info(f"After voxel down (voxel={v:.3f}m): {len(pcd.points):,}")
-        if len(pcd.points) <= 10_000_000:
+        if len(pcd.points) <= safety_cap:
             break
 
     pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=outlier_nb, std_ratio=outlier_std)

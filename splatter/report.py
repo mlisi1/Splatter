@@ -20,17 +20,27 @@ logger = logging.getLogger("gs_init")
 # ---------------------------------------------------------------------------
 
 def generate(output_dir: Path, cameras: dict, images: dict,
-             points3d: dict, stats: dict) -> Path:
+             points3d: dict, stats: dict, gs_suggestion: dict | None = None,
+             sfm_points3d: dict | None = None, coverage_stats: dict | None = None) -> Path:
     """
     Build a self-contained HTML report and write it to <output_dir>/report.html.
     Returns the path to the report.
+
+    sfm_points3d, if given, is used for track-length stats instead of points3d: after
+    Stage 4 densification, points3d holds the depth-unprojected cloud where every point
+    has an empty track, which would make _section_tracks silently render nothing.
     """
     sections = []
+    tracks_points3d = sfm_points3d if sfm_points3d is not None else points3d
 
     sections.append(_section_summary(stats))
+    if gs_suggestion:
+        sections.append(_section_2dgs_suggestion(gs_suggestion))
+    if coverage_stats:
+        sections.append(_section_coverage(coverage_stats))
     sections.append(_section_cameras(images))
     sections.append(_section_reprojection(points3d))
-    sections.append(_section_tracks(points3d))
+    sections.append(_section_tracks(tracks_points3d))
     sections.append(_section_observations(images))
     sections.append(_section_sample_frames(output_dir))
     sections.append(_section_depth_maps(output_dir))
@@ -64,6 +74,88 @@ def _section_summary(stats: dict) -> str:
         f"<tr><td>{k}</td><td><strong>{v}</strong></td></tr>" for k, v in rows
     )
     return _card("Pipeline Summary", f"<table class='summary'>{trs}</table>")
+
+
+def _section_2dgs_suggestion(s: dict) -> str:
+    rows = [
+        ("Detected scene type", s["scene_type"]),
+        ("Convergence ratio", f"{s['convergence_ratio']:.3f}  "
+                              f"(ray RMS {s['ray_rms']:.2f} m / scene diagonal {s['scene_diag']:.2f} m)"),
+        ("Loop closure ratio", f"{s['loop_ratio']:.3f}"),
+        ("Suggested --depth_ratio", s["depth_ratio"]),
+        ("Suggested --lambda_dist", s["lambda_dist"]),
+    ]
+    trs = "\n".join(f"<tr><td>{k}</td><td><strong>{v}</strong></td></tr>" for k, v in rows)
+    body = (
+        f"<table class='summary'>{trs}</table>"
+        f"<p>{s['reasoning']}</p>"
+        f"<p>Heuristic only — a starting point for manual tuning, not a guarantee.</p>"
+        f"<pre style='background:#f4f6f9;padding:10px;border-radius:4px;overflow-x:auto'>{s['command']}</pre>"
+    )
+    return _card("2DGS Suggested Parameters", body)
+
+
+def _section_coverage(c: dict) -> str:
+    ratios = c["baseline_depth_ratio"]
+    rot_degs = c["gap_rotation_deg"]
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+
+    ax = axes[0]
+    ax.plot(ratios, color="#c44e52", lw=1)
+    ax.axhline(c["translation_ratio_threshold"], color="crimson", lw=1, linestyle="--",
+               label=f"flag threshold ({c['translation_ratio_threshold']})")
+    ax.set_ylabel("Baseline / depth")
+    ax.set_title("Inter-frame baseline/depth ratio")
+    ax.legend(fontsize=8)
+
+    ax = axes[1]
+    ax.plot(rot_degs, color="#4c72b0", lw=1)
+    ax.axhline(c["rotation_deg_threshold"], color="navy", lw=1, linestyle="--",
+               label=f"flag threshold ({c['rotation_deg_threshold']:.0f}°)")
+    ax.set_ylabel("Rotation gap (deg)")
+    ax.set_xlabel("Consecutive registered frame pair (temporal order)")
+    ax.set_title("Inter-frame rotation gap")
+    ax.legend(fontsize=8)
+
+    fig.tight_layout()
+    img_b64 = _fig_to_b64(fig)
+    plt.close(fig)
+
+    rows = [
+        ("Verdict", c["verdict"]),
+        ("Reasoning", c["reasoning"]),
+        ("Registered images", f"{c['n_images']:,}"),
+        ("Mean SfM track length", f"{c['mean_track_length']:.2f}" if c["mean_track_length"] is not None else "N/A"),
+        ("Weakly-triangulated points (track < 3)",
+         f"{c['frac_weak_points']:.1%}" if c["frac_weak_points"] is not None else "N/A"),
+        ("Mean / min observations per image", f"{c['mean_obs_per_image']:.0f} / {c['min_obs_per_image']}"),
+        ("Baseline/depth gaps flagged", f"{c['n_translation_flagged']} / {c['n_gaps']}"),
+        ("Rotation gaps flagged", f"{c['n_rotation_flagged']} / {c['n_gaps']}"),
+    ]
+    trs = "\n".join(f"<tr><td>{k}</td><td><strong>{v}</strong></td></tr>" for k, v in rows)
+
+    worst = ""
+    if c["worst_translation_gaps"]:
+        items = "".join(
+            f"<li>{g['image_a']} &rarr; {g['image_b']}: ratio {g['ratio']:.2f} (gap {g['gap_m']:.2f} m)</li>"
+            for g in c["worst_translation_gaps"]
+        )
+        worst += f"<p><strong>Worst baseline/depth gaps:</strong></p><ul>{items}</ul>"
+    if c["worst_rotation_gaps"]:
+        items = "".join(
+            f"<li>{g['image_a']} &rarr; {g['image_b']}: {g['rotation_deg']:.1f}&deg;</li>"
+            for g in c["worst_rotation_gaps"]
+        )
+        worst += f"<p><strong>Worst rotation gaps:</strong></p><ul>{items}</ul>"
+
+    body = (
+        f"<table class='summary'>{trs}</table>"
+        f"<p style='margin-top:12px'>Heuristic only — a diagnostic prompt, not an automated pass/fail gate.</p>"
+        f"{_img(img_b64)}"
+        f"{worst}"
+    )
+    return _card("Image Coverage Diagnostic", body)
 
 
 def _section_cameras(images: dict) -> str:

@@ -2,6 +2,7 @@
 """GS Initialization Pipeline — CLI entry point."""
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -10,7 +11,7 @@ import numpy as np
 
 from splatter.io.colmap import read_model
 from splatter.io.ply import write_ply
-from splatter.stages import densification, extraction, features, sfm, telemetry, undistort
+from splatter.stages import coverage, densification, extraction, features, gs_params, sfm, telemetry, undistort
 from splatter.utils.logging import setup_logging
 from splatter import report as report_gen
 
@@ -45,7 +46,12 @@ def parse_args() -> argparse.Namespace:
                    help="Frame extraction rate (default: 5)")
     p.add_argument("--auto-fps", action="store_true",
                    help="Probe 5/7/10 fps on a 30s clip to find the minimum rate that achieves full registration")
-    p.add_argument("--max-frames", type=int, default=2000)
+    p.add_argument("--max-frames", type=int, default=10000,
+                   help="Hard cap on extracted frames. If ffmpeg extraction produces more "
+                        "than this, the temporal tail is dropped (frames are numbered in "
+                        "capture order, so this keeps only the first N seconds of footage, "
+                        "not an evenly spaced subsample) — lower --fps or use --auto-fps "
+                        "instead of relying on this cap to thin a long video.")
     p.add_argument("--iqa-threshold", type=float, default=0.5,
                    help="Blur rejection threshold 0–1 (0 = keep all)")
     p.add_argument("--dedup-threshold", type=float, default=0.0,
@@ -88,6 +94,13 @@ def parse_args() -> argparse.Namespace:
                    help="Skip densification; use raw SfM sparse cloud")
     p.add_argument("--skip-sfm", action="store_true",
                    help="Skip SfM if sparse/0/ already exists")
+    p.add_argument("--cleanup", action="store_true",
+                   help="After the pipeline finishes, delete intermediate artifacts "
+                        "(sparse/, sparse_txt/, database.db, feature/match caches, "
+                        "pairs files, depth/, images_distorted/) leaving only "
+                        "<name>_dataset/, config.json, report.html, and points3D.ply. "
+                        "Irreversible: --skip-sfm and cached-depth reprocessing can no "
+                        "longer resume this output directory afterward.")
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     return p.parse_args()
 
@@ -160,20 +173,73 @@ def print_summary(stats: dict, output_dir: Path, elapsed: float, logger) -> None
     logger.info(msg)
 
 
+def _write_pipeline_config(output_dir: Path, args: argparse.Namespace, stats: dict) -> None:
+    """
+    Persist the CLI args used for this invocation, plus the true Stage 1
+    frame-count stats, to <output>/config.json — lets a user check exactly
+    what parameters produced a given reconstruction.
+
+    The frame counts are the reason this is written on *every* invocation,
+    not just the first: on a resumed run (extraction skipped because
+    images/ already exists) they're read back via _read_prior_extraction_stats
+    rather than re-derived from images/'s current contents, which by then
+    already reflect post-IQA/dedup/undistortion filtering.
+    """
+    config_path = output_dir / "config.json"
+    args_dict = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
+    data = {
+        "args": args_dict,
+        "frames_extracted": stats["frames_extracted"],
+        "frames_after_iqa": stats["frames_after_iqa"],
+        "frames_after_dedup": stats["frames_after_dedup"],
+    }
+    config_path.write_text(json.dumps(data, indent=2))
+
+
+def _read_prior_extraction_stats(output_dir: Path) -> dict | None:
+    """Read back frames_extracted/frames_after_iqa/frames_after_dedup from a
+    prior run's config.json, or None if it doesn't exist / is unreadable."""
+    config_path = output_dir / "config.json"
+    if not config_path.exists():
+        return None
+    try:
+        data = json.loads(config_path.read_text())
+        return {
+            "frames_extracted": data["frames_extracted"],
+            "frames_after_iqa": data["frames_after_iqa"],
+            "frames_after_dedup": data["frames_after_dedup"],
+        }
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def _create_gs_dataset(output_dir: Path, logger) -> None:
+def _create_dataset_folder(output_dir: Path, logger) -> Path:
     """
-    Create <output>/gs_dataset/ — a minimal COLMAP dataset ready for any GS trainer.
+    Create <output>/<output_dir.name>_dataset/ — a self-contained COLMAP
+    dataset ready for any GS trainer, with real (non-symlinked) image files
+    so the whole folder can be copied elsewhere (e.g. to a Jetson for
+    training) without leaving behind a symlink that breaks once separated
+    from its target.
 
-    Uses the human-readable text format (cameras.txt / images.txt / points3D.txt)
-    which is accepted by all major trainers alongside the binary format.
+    images/ is *moved* (not copied) into the dataset folder — still only one
+    copy of the frame set on disk — and a relative symlink is left behind at
+    <output>/images pointing into the dataset folder, so every other part of
+    the pipeline that expects <output>/images to exist (extract_frames'
+    resume check, undistort_images' idempotency gate, report.html thumbnails
+    on a later --skip-sfm run) keeps working unmodified; the symlink itself
+    lives outside the dataset folder, so copying the dataset folder alone
+    never carries a symlink with it. Idempotent: if <output>/images is
+    already a symlink (the move already happened on a prior run against this
+    output dir), the move step is skipped and only the sparse/*.txt files
+    (which may have changed, e.g. after a densification re-tune) are refreshed.
 
     Layout:
-        gs_dataset/
-        ├── images/       → symlink to ../images  (avoids duplicating large frame set)
+        <name>_dataset/
+        ├── images/       real directory (moved from <output>/images/)
         └── sparse/
             └── 0/
                 ├── cameras.txt
@@ -183,27 +249,65 @@ def _create_gs_dataset(output_dir: Path, logger) -> None:
     import shutil
 
     src_txt = output_dir / "sparse_txt" / "0"
-    gs_dir = output_dir / "gs_dataset"
-    gs_sparse = gs_dir / "sparse" / "0"
-    gs_sparse.mkdir(parents=True, exist_ok=True)
+    dataset_dir = output_dir / f"{output_dir.name}_dataset"
+    dataset_sparse = dataset_dir / "sparse" / "0"
+    dataset_sparse.mkdir(parents=True, exist_ok=True)
 
-    # Symlink images — relative path keeps the folder self-contained
-    img_link = gs_dir / "images"
-    if img_link.exists() or img_link.is_symlink():
-        img_link.unlink()
-    img_link.symlink_to(Path("../images"))
+    images_dir = output_dir / "images"
+    dataset_images = dataset_dir / "images"
+
+    if images_dir.is_symlink():
+        pass  # already moved by a prior run against this output dir
+    elif images_dir.is_dir():
+        if dataset_images.exists():
+            shutil.rmtree(dataset_images)
+        images_dir.rename(dataset_images)
+        images_dir.symlink_to(Path(f"{dataset_dir.name}/images"))
 
     # Copy the three COLMAP text files
     for fname in ("cameras.txt", "images.txt", "points3D.txt"):
         src = src_txt / fname
         if src.exists():
-            shutil.copy2(src, gs_sparse / fname)
+            shutil.copy2(src, dataset_sparse / fname)
 
-    logger.info(f"GS-ready dataset: {gs_dir}")
+    logger.info(f"GS-ready dataset: {dataset_dir}")
     logger.info("  Train with:")
-    logger.info(f"    2DGS / 3DGS  : python train.py -s {gs_dir}")
-    logger.info(f"    gsplat       : ns-train splatfacto --data {gs_dir}")
-    logger.info(f"    OpenSplat    : opensplat {gs_dir} -n 30000")
+    logger.info(f"    2DGS / 3DGS  : python train.py -s {dataset_dir}")
+    logger.info(f"    gsplat       : ns-train splatfacto --data {dataset_dir}")
+    logger.info(f"    OpenSplat    : opensplat {dataset_dir} -n 30000")
+    return dataset_dir
+
+
+def _cleanup_intermediate_files(output_dir: Path, logger) -> None:
+    """
+    Delete everything in output_dir except the GS-ready dataset folder,
+    config.json, report.html, and points3D.ply.
+
+    Irreversible: removes the SfM sparse model, feature/match caches, and
+    cached depth maps that --skip-sfm and depth-map reprocessing rely on to
+    resume this output directory, so run it only once you're done tuning.
+    """
+    import shutil
+
+    keep = {
+        f"{output_dir.name}_dataset",
+        "config.json", "report.html", "points3D.ply", "pipeline.log",
+        "telemetry_ref_images.txt", "telemetry_transform.txt",
+        "2dgs_suggested_params.txt", "coverage_report.txt",
+    }
+
+    freed = 0
+    for entry in output_dir.iterdir():
+        if entry.name in keep:
+            continue
+        if entry.is_dir() and not entry.is_symlink():
+            freed += sum(f.stat().st_size for f in entry.rglob("*") if f.is_file())
+            shutil.rmtree(entry)
+        else:
+            freed += entry.stat().st_size if entry.exists() else 0
+            entry.unlink()
+
+    logger.info(f"--cleanup: removed intermediate artifacts ({freed / 1e6:.1f} MB freed)")
 
 
 def main() -> None:
@@ -236,14 +340,32 @@ def main() -> None:
     frames, extraction_skipped = extraction.extract_frames(args.video, output_dir, fps, args.max_frames, args.resize)
     stats["frames_extracted"] = len(frames)
     if extraction_skipped:
-        logger.info("Skipping IQA + dedup (frames already filtered by prior run)")
-        stats["frames_after_iqa"] = len(frames)
-        stats["frames_after_dedup"] = len(frames)
+        prior = _read_prior_extraction_stats(output_dir)
+        if prior is not None:
+            logger.info(
+                "Skipping IQA + dedup (frames already filtered by prior run) — "
+                f"restoring true frame counts from config.json: "
+                f"extracted={prior['frames_extracted']}, after_iqa={prior['frames_after_iqa']}, "
+                f"after_dedup={prior['frames_after_dedup']}"
+            )
+            stats["frames_extracted"] = prior["frames_extracted"]
+            stats["frames_after_iqa"] = prior["frames_after_iqa"]
+            stats["frames_after_dedup"] = prior["frames_after_dedup"]
+        else:
+            logger.warning(
+                "Skipping IQA + dedup (frames already filtered by prior run) — no "
+                "config.json from a prior run found, so frame-count stats will reflect "
+                "the current images/ folder, not the true original extraction/IQA counts"
+            )
+            stats["frames_after_iqa"] = len(frames)
+            stats["frames_after_dedup"] = len(frames)
     else:
         frames = extraction.filter_blurry_frames(frames, args.iqa_threshold)
         stats["frames_after_iqa"] = len(frames)
         frames = extraction.filter_duplicate_frames(frames, args.dedup_threshold)
         stats["frames_after_dedup"] = len(frames)
+
+    _write_pipeline_config(output_dir, args, stats)
 
     # ---- Stage 1.5: Known-calibration undistortion (optional) --------------
     if args.calibration is not None:
@@ -370,6 +492,25 @@ def main() -> None:
     write_ply(points3d, ply_path)
     logger.info(f"PLY written: {ply_path}  ({len(points3d):,} points)")
 
+    # ---- 2DGS suggested training parameters (heuristic) --------------------
+    gs_suggestion = gs_params.suggest_2dgs_params(images, points3d)
+    if gs_suggestion:
+        logger.info(
+            f"2DGS suggestion: {gs_suggestion['scene_type']} — {gs_suggestion['command']}"
+        )
+        gs_params.write_suggestion_file(output_dir, gs_suggestion)
+
+    # ---- Image coverage diagnostic (heuristic) ------------------------------
+    sfm_points3d = coverage.load_sfm_points3d(sparse_0, points3d)
+    coverage_stats = coverage.analyze_coverage(images, sfm_points3d)
+    if coverage_stats:
+        logger.info(f"Coverage diagnostic: {coverage_stats['verdict']} ({coverage_stats['reasoning']})")
+        if coverage_stats["verdict"] != "Good — coverage looks adequate":
+            logger.warning(
+                "Image coverage may be too sparse for good GS training — see coverage_report.txt"
+            )
+        coverage.write_coverage_file(output_dir, coverage_stats)
+
     # ---- Validation --------------------------------------------------------
     logger.info("\n=== Validation ===")
     valid = validate_output(output_dir, logger)
@@ -377,7 +518,8 @@ def main() -> None:
 
     # ---- Report ------------------------------------------------------------
     logger.info("\n=== Generating report ===")
-    report_path = report_gen.generate(output_dir, cameras, images, points3d, stats)
+    report_path = report_gen.generate(output_dir, cameras, images, points3d, stats, gs_suggestion,
+                                       sfm_points3d, coverage_stats)
     logger.info(f"Open in a browser: {report_path}")
 
     if not valid:
@@ -385,9 +527,16 @@ def main() -> None:
         sys.exit(1)
 
     # ---- GS-ready dataset folder ----------------------------------------
-    _create_gs_dataset(output_dir, logger)
+    _create_dataset_folder(output_dir, logger)
 
-    logger.info("Pipeline complete.")
+    # ---- Cleanup (optional) ------------------------------------------------
+    if args.cleanup:
+        logger.info("\n=== Cleanup ===")
+        _cleanup_intermediate_files(output_dir, logger)
+
+    total_elapsed = time.time() - t0
+    mins, secs = int(total_elapsed // 60), int(total_elapsed % 60)
+    logger.info(f"Pipeline complete in {mins}m {secs}s.")
 
 
 if __name__ == "__main__":

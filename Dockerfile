@@ -78,9 +78,30 @@ COPY splatter/ splatter/
 COPY entry_script.sh /usr/local/bin/entry_script.sh
 RUN chmod +x /usr/local/bin/entry_script.sh
 
-# Model weights cache dir — bind-mounted at runtime so weights persist
+# Model weights cache dir — /cache/.cache is bind-mounted at runtime (see
+# docker-compose.yml) so every downloaded checkpoint persists across container
+# restarts/recreation and never re-downloads after the first run: DAv2 (its own
+# manual cache_dir under ~/.cache/depth_anything_v2), hloc's NetVLAD/DISK/ALIKED/
+# LightGlue (all resolve through torch.hub, hence TORCH_HOME below), and the
+# SegFormer sky-mask model (resolves through HuggingFace's cache, hence HF_HOME).
 ENV HOME=/cache
-RUN mkdir -p /cache/depth_anything_v2
+ENV TORCH_HOME=/cache/.cache/torch
+ENV HF_HOME=/cache/.cache/huggingface
+RUN mkdir -p /cache/.cache/depth_anything_v2 /cache/.cache/torch /cache/.cache/huggingface
+
+# Run as a non-root user so files written to bind-mounted host directories
+# (./data/output, and ./pipeline.py/splatter/ during development) come out
+# owned by the host user instead of root. Ubuntu 24.04 already ships a
+# preconfigured "ubuntu" user at UID/GID 1000:1000 — the same UID/GID as the
+# first non-system user on virtually any single-user Linux install (including
+# this project's host machine), so no build-arg parameterization is needed.
+# Everything this user needs at runtime is already in place: COLMAP, the
+# venv, and exiftool are all installed world-readable/executable (default
+# umask from apt/pip/ninja install), and the CUDA base image's own
+# entrypoint (/opt/nvidia/nvidia_entrypoint.sh) only prints banner text —
+# no privileged setup — so GPU access needs no root step here either.
+RUN chown -R ubuntu:ubuntu /cache/.cache /workspace
+USER ubuntu
 
 # Keep the container alive so docker compose exec can be used
 CMD ["tail", "-f", "/dev/null"]

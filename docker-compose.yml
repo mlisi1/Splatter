@@ -17,7 +17,7 @@ services:
       - ./entry_script.sh:/usr/local/bin/entry_script.sh
       - ./data/input:/data/input:ro      # put videos, PLY files, extrinsics here
       - ./data/output:/data/output       # pipeline writes here
-      - dav2_weights:/cache/.cache/depth_anything_v2  # model weights survive restarts
+      - model_cache:/cache/.cache        # DAv2 + hloc (torch.hub) + HF sky-mask weights survive restarts
 
 volumes:
-  dav2_weights:
+  model_cache:
