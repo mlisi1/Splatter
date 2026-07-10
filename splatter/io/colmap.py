@@ -121,6 +121,32 @@ def read_points3d_binary(path: Path) -> dict[int, Point3D]:
     return points3d
 
 
+def read_points3d_stats(path: Path) -> tuple[int, np.ndarray]:
+    """
+    Lightweight points3D.bin scan for count + reprojection errors only —
+    skips building xyz/rgb/track arrays or Point3D objects per point.
+    Callers that only need len(points3d) and per-point .error (e.g.
+    sfm.check_quality) would otherwise pay to materialize every point via
+    read_points3d_binary just to discard it; that's especially wasteful with
+    --skip-sfm against a sparse/0 a prior run already densified to millions
+    of points, where check_quality's own stats are the only reason the file
+    gets read at all.
+    """
+    errors = []
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        for _ in range(n):
+            f.read(8)  # id
+            f.read(24)  # xyz
+            f.read(3)  # rgb
+            error = struct.unpack("<d", f.read(8))[0]
+            track_len = struct.unpack("<Q", f.read(8))[0]
+            f.read(8 * track_len)  # track (image_id, point2D_idx pairs)
+            if error > 0:
+                errors.append(error)
+    return n, np.array(errors, dtype=np.float64)
+
+
 def read_model(sparse_dir: Path) -> ColmapModel:
     """Read cameras, images, and points3D from a COLMAP sparse directory."""
     return (

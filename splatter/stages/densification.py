@@ -136,28 +136,30 @@ def reprocess_depth_maps(
     images_dir = output_dir / "images"
     depth_dir = output_dir / "depth"
 
-    all_pts, all_cols = [], []
+    cloud = _StreamingCloud(voxel_size)
 
-    for img_data in tqdm(list(images.values()), desc="Unprojecting cached depth maps"):
-        img_path = images_dir / img_data.name
-        depth_path = depth_dir / (img_path.stem + ".npy")
-        if not depth_path.exists() or not img_path.exists():
-            continue
+    for batch in _batches(list(images.values()), 50):
+        for img_data in tqdm(batch, desc="Unprojecting cached depth maps"):
+            img_path = images_dir / img_data.name
+            depth_path = depth_dir / (img_path.stem + ".npy")
+            if not depth_path.exists() or not img_path.exists():
+                continue
 
-        cam = cameras[img_data.camera_id]
-        K = get_intrinsics(cam)
-        R = qvec2rotmat(img_data.qvec)
-        t = img_data.tvec
+            cam = cameras[img_data.camera_id]
+            K = get_intrinsics(cam)
+            R = qvec2rotmat(img_data.qvec)
+            t = img_data.tvec
 
-        d_metric = np.load(str(depth_path))
-        img_bgr = cv2.imread(str(img_path))
-        pts_w, cols = unproject_depth(d_metric, K, R, t, img_bgr)
-        all_pts.append(pts_w)
-        all_cols.append(cols)
+            d_metric = np.load(str(depth_path))
+            img_bgr = cv2.imread(str(img_path))
+            pts_w, cols = unproject_depth(d_metric, K, R, t, img_bgr)
+            cloud.add(pts_w, cols)
 
-    return _build_point3d_dict(_merge_and_downsample(
-        all_pts, all_cols,
-        voxel_size=voxel_size, max_points=max_points,
+        cloud.flush()
+        gc.collect()
+
+    return _build_point3d_dict(_finalize_cloud(
+        cloud, max_points=max_points,
         outlier_nb=outlier_nb, outlier_std=outlier_std,
     ))
 
@@ -206,7 +208,7 @@ def run_images_only(
         sfm_points3d = read_points3d_binary(sfm_pts_path)
         logger.info(f"Using SfM backup ({len(sfm_points3d):,} pts) for depth alignment")
 
-    all_pts, all_cols = [], []
+    cloud = _StreamingCloud(voxel_size)
 
     for batch in _batches(list(images.values()), 50):
         for img_data in tqdm(batch, desc="Depth estimation"):
@@ -270,14 +272,13 @@ def run_images_only(
             np.save(depth_dir / (img_path.stem + ".npy"), d_metric)
 
             pts_w, cols = unproject_depth(d_metric, K, R, t, img_bgr)
-            all_pts.append(pts_w)
-            all_cols.append(cols)
+            cloud.add(pts_w, cols)
 
+        cloud.flush()
         gc.collect()
 
-    return _build_point3d_dict(_merge_and_downsample(
-        all_pts, all_cols,
-        voxel_size=voxel_size, max_points=max_points,
+    return _build_point3d_dict(_finalize_cloud(
+        cloud, max_points=max_points,
         outlier_nb=outlier_nb, outlier_std=outlier_std,
     ))
 
@@ -333,7 +334,7 @@ def run_lidar(
     T_lidar_to_cam = np.linalg.inv(T_cam_to_lidar)
     pts_hom = np.hstack([pts_lidar, np.ones((len(pts_lidar), 1))])
 
-    all_pts, all_cols = [], []
+    cloud = _StreamingCloud(voxel_size)
 
     for batch in _batches(list(images.values()), 50):
         for img_data in tqdm(batch, desc="LiDAR+Depth estimation"):
@@ -397,14 +398,13 @@ def run_lidar(
             np.save(depth_dir / (img_path.stem + ".npy"), d_fused)
 
             pts_w, cols = unproject_depth(d_fused, K, R, t, img_bgr)
-            all_pts.append(pts_w)
-            all_cols.append(cols)
+            cloud.add(pts_w, cols)
 
+        cloud.flush()
         gc.collect()
 
-    return _build_point3d_dict(_merge_and_downsample(
-        all_pts, all_cols,
-        voxel_size=voxel_size, max_points=max_points,
+    return _build_point3d_dict(_finalize_cloud(
+        cloud, max_points=max_points,
         outlier_nb=outlier_nb, outlier_std=outlier_std,
     ))
 
@@ -519,46 +519,102 @@ def _align_to_sfm(img_data, points3d: dict, R: np.ndarray, t: np.ndarray,
     return s, b
 
 
-def _merge_and_downsample(
-    all_pts: list,
-    all_cols: list,
-    voxel_size: float = 0.02,
+class _StreamingCloud:
+    """
+    Accumulates unprojected per-frame points into a running voxel-downsampled
+    cloud instead of buffering every frame's raw points for the whole video.
+
+    Peak RAM is bounded by one flush batch's raw points plus the current
+    (already-downsampled, so much smaller) accumulator, instead of
+    O(frames × points-per-frame) — the latter is what OOMs on long captures
+    at full resolution even with a small --voxel-size, since the old
+    implementation only downsampled once, after every frame was concatenated.
+    Trades speed (one voxel_down_sample call over the whole accumulator per
+    flush() instead of one per whole run) for that bounded memory footprint.
+
+    add() only buffers — it does NOT merge into self.pcd per frame. Merging
+    every single frame is O(current accumulator size) per call (concatenate +
+    re-downsample the *entire* running cloud), so cost grows with how much of
+    the video has been processed already: observed directly as per-frame
+    "Depth estimation" iterations going from ~0.9s to ~5s over a ~1000-frame
+    run once merging was (incorrectly) done per-frame. Call flush() at the
+    end of each outer batch (see _batches() in run_images_only/run_lidar)
+    instead, so the expensive whole-accumulator merge happens ~20x total for
+    a 1000-frame run instead of 1000x.
+    """
+
+    def __init__(self, voxel_size: float):
+        import open3d as o3d
+        self._o3d = o3d
+        self.voxel_size = voxel_size
+        self.pcd = o3d.geometry.PointCloud()
+        self.n_raw = 0
+        self._buf_pts: list[np.ndarray] = []
+        self._buf_cols: list[np.ndarray] = []
+
+    def add(self, pts: np.ndarray, cols: np.ndarray) -> None:
+        if len(pts) == 0:
+            return
+        self.n_raw += len(pts)
+        self._buf_pts.append(pts)
+        self._buf_cols.append(cols)
+
+    def flush(self) -> None:
+        """Merge buffered frames into the running downsampled cloud."""
+        if not self._buf_pts:
+            return
+        pts = np.concatenate(self._buf_pts, axis=0)
+        cols = np.concatenate(self._buf_cols, axis=0)
+        self._buf_pts, self._buf_cols = [], []
+
+        batch_pcd = self._o3d.geometry.PointCloud()
+        batch_pcd.points = self._o3d.utility.Vector3dVector(pts.astype(np.float64))
+        batch_pcd.colors = self._o3d.utility.Vector3dVector(cols.astype(np.float64) / 255.0)
+        batch_pcd = batch_pcd.voxel_down_sample(self.voxel_size)
+
+        self.pcd += batch_pcd
+        self.pcd = self.pcd.voxel_down_sample(self.voxel_size)
+
+
+def _finalize_cloud(
+    cloud: "_StreamingCloud",
     max_points: int = 5_000_000,
     outlier_nb: int = 20,
     outlier_std: float = 3.0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    import open3d as o3d
+    pcd = cloud.pcd
+    logger.info(f"Total raw points seen: {cloud.n_raw:,} -> {len(pcd.points):,} after streaming voxel merge")
 
-    if not all_pts:
+    if len(pcd.points) == 0:
         return np.empty((0, 3)), np.empty((0, 3), dtype=np.uint8)
 
-    pts = np.concatenate(all_pts, axis=0)
-    cols = np.concatenate(all_cols, axis=0)
-    logger.info(f"Total raw points: {len(pts):,}")
-
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
-    pcd.colors = o3d.utility.Vector3dVector(cols.astype(np.float64) / 255.0)
-
-    # Initial voxel downsample — increase size until under the safety cap.
-    # The cap is the larger of 10M and the user's own --max-points target, so
-    # a user-requested target above 10M (e.g. --max-points 15000000) isn't
-    # silently overridden by escalating voxel size past what they actually need.
-    safety_cap = max(max_points, 10_000_000)
-    for v in (voxel_size, voxel_size * 1.5, voxel_size * 2.5):
+    # Escalate voxel size until under max_points *before* running outlier
+    # removal. remove_statistical_outlier builds a KD-tree over every
+    # remaining point and does a per-point neighbour query — that's the real
+    # RAM/time hotspot for a large merged cloud (observed OOM on a 32 GB host
+    # with it running against 13M points), not voxel_down_sample. The
+    # previous version only tried two fixed multipliers (1.5x, 2.5x) against
+    # a looser safety cap and gave up regardless of whether that was enough —
+    # which is exactly how a 26M-point cloud was still 13.3M points by the
+    # time outlier removal ran. Loop until actually under max_points instead,
+    # so outlier removal only ever runs against a bounded cloud size. Since
+    # outlier removal only removes points, the result stays <= max_points
+    # afterward — no secondary downsample pass needed.
+    v = cloud.voxel_size
+    attempts = 0
+    while len(pcd.points) > max_points and attempts < 12:
+        v *= 1.4
         pcd = pcd.voxel_down_sample(v)
         logger.info(f"After voxel down (voxel={v:.3f}m): {len(pcd.points):,}")
-        if len(pcd.points) <= safety_cap:
-            break
+        attempts += 1
+    if len(pcd.points) > max_points:
+        logger.warning(
+            f"Still {len(pcd.points):,} points after {attempts} escalations "
+            f"(voxel={v:.3f}m) — proceeding to outlier removal anyway"
+        )
 
     pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=outlier_nb, std_ratio=outlier_std)
     logger.info(f"After outlier removal: {len(pcd.points):,}")
-
-    # Secondary downsample to hit the max_points target
-    if len(pcd.points) > max_points:
-        v2 = voxel_size * 1.5
-        pcd = pcd.voxel_down_sample(v2)
-        logger.info(f"Re-downsampled to {len(pcd.points):,} (voxel={v2:.3f}m)")
 
     pts_out = np.asarray(pcd.points)
     cols_out = (np.asarray(pcd.colors) * 255).clip(0, 255).astype(np.uint8)

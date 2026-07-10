@@ -9,9 +9,9 @@ from pathlib import Path
 
 import numpy as np
 
-from splatter.io.colmap import read_model
+from splatter.io.colmap import read_cameras_binary, read_images_binary, read_points3d_binary
 from splatter.io.ply import write_ply
-from splatter.stages import coverage, densification, extraction, features, gs_params, sfm, telemetry, undistort
+from splatter.stages import coverage, densification, extraction, features, gs_params, orientation, sfm, telemetry, undistort
 from splatter.utils.logging import setup_logging
 from splatter import report as report_gen
 
@@ -41,6 +41,15 @@ def parse_args() -> argparse.Namespace:
                         "'auto' detects whichever is present; 'off' disables this stage. "
                         "Ignored (skipped) when --lidar is supplied — LiDAR already provides "
                         "metric scale.")
+    p.add_argument("--align-up", choices=["auto", "off"], default="auto",
+                   help="Rotate the reconstruction so its true vertical direction (estimated "
+                        "from vanishing-point detection on the frames) matches world -Y. "
+                        "Monocular SfM has no constraint forcing this — the arbitrary bundle-"
+                        "adjustment rotation only lands close to -Y-up by coincidence for a "
+                        "roughly level capture, leaving a residual skew. Pure rotation, no "
+                        "rescaling, so it runs regardless of --lidar. 'auto' (default) skips "
+                        "itself when Stage 3.6 telemetry georegistration already succeeded "
+                        "(real GPS-derived orientation beats this heuristic); 'off' disables it.")
     p.add_argument("--output", type=Path, default=Path("./output"), help="Output directory")
     p.add_argument("--fps", type=float, default=None,
                    help="Frame extraction rate (default: 5)")
@@ -109,7 +118,15 @@ def parse_args() -> argparse.Namespace:
 # Validation
 # ---------------------------------------------------------------------------
 
-def validate_output(output_dir: Path, logger) -> bool:
+def validate_output(output_dir: Path, logger, images: dict, n_points: int) -> bool:
+    """
+    images/n_points are passed in from the caller's already-loaded model
+    rather than re-read from sparse_0 here — points3D.bin can hold millions
+    of entries for a densified cloud, and the caller already has both loaded
+    for report generation, so a second full read (a third copy of the point
+    cloud alongside `new_pts` and the caller's own `points3d`) was pure
+    memory pressure for a check that only needs a count.
+    """
     sparse_0 = output_dir / "sparse" / "0"
     images_dir = output_dir / "images"
     ok = True
@@ -123,13 +140,11 @@ def validate_output(output_dir: Path, logger) -> bool:
     if not ok:
         return False
 
-    _, images, points3d = read_model(sparse_0)
-
     if len(images) < 20:
         logger.error(f"Only {len(images)} registered images (need ≥ 20)")
         ok = False
-    if len(points3d) < 1000:
-        logger.error(f"Only {len(points3d)} 3D points (need ≥ 1000)")
+    if n_points < 1000:
+        logger.error(f"Only {n_points} 3D points (need ≥ 1000)")
         ok = False
 
     missing = [img.name for img in images.values()
@@ -162,6 +177,7 @@ def print_summary(stats: dict, output_dir: Path, elapsed: float, logger) -> None
         f"\n Frames registered      : {n_reg:,}  ({reg_pct:.1f}%)"
         f"\n Sparse points (SfM)    : {stats['sparse_points']:,}"
         f"\n Georegistration        : {stats['georegistration']}"
+        f"\n Up-axis aligned        : {stats['up_axis_aligned']}"
         f"\n Densification branch   : {stats['densification_branch']}"
         f"\n Densified points       : {stats['densified_points']:,}"
         f"\n Mean reprojection error: {stats['mean_reproj']:.2f} px"
@@ -325,7 +341,7 @@ def main() -> None:
     stats = dict(
         frames_extracted=0, frames_after_iqa=0, frames_after_dedup=0, frames_registered=0,
         sparse_points=0, densified_points=0, mean_reproj=0.0,
-        densification_branch="None", georegistration="None",
+        densification_branch="None", georegistration="None", up_axis_aligned="No",
     )
 
     # ---- Stage 1: Frame Extraction ----------------------------------------
@@ -411,6 +427,7 @@ def main() -> None:
     undistort.undistort_images(output_dir, sparse_0)
 
     # ---- Stage 3.6: Georegistration from telemetry (optional) --------------
+    telemetry_source = None
     if args.lidar is not None:
         if args.telemetry != "off":
             logger.info(
@@ -423,11 +440,33 @@ def main() -> None:
         if telemetry_source:
             stats["georegistration"] = telemetry_source
 
+    # ---- Stage 3.7: Up-axis alignment (optional) ----------------------------
+    if args.align_up == "off":
+        logger.info("\n=== Stage 3.7: Up-axis alignment ===\nSkipping (--align-up off)")
+    elif telemetry_source:
+        logger.info(
+            "\n=== Stage 3.7: Up-axis alignment ===\n"
+            "Skipping — telemetry georegistration already grounded orientation to real GPS"
+        )
+    else:
+        logger.info("\n=== Stage 3.7: Up-axis alignment ===")
+        if orientation.align_up_axis(output_dir, sparse_0):
+            stats["up_axis_aligned"] = "Yes"
+
     # ---- Stage 4: Densification --------------------------------------------
     depth_dir = output_dir / "depth"
     densification_done = depth_dir.exists() and any(depth_dir.glob("*.npy"))
+    ply_path = output_dir / "points3D.ply"
+    ply_already_exists = ply_path.exists()
 
-    if args.no_densify:
+    new_pts = None  # only set when densification actually ran and produced points
+    if ply_already_exists:
+        logger.info(
+            f"Skipping densification — {ply_path} already exists from a prior "
+            "completed run (delete it, or the whole output dir, to force re-densification)"
+        )
+        stats["densification_branch"] = "Skipped (points3D.ply already exists)"
+    elif args.no_densify:
         logger.info("Skipping densification (--no-densify)")
         stats["densification_branch"] = "None (skipped)"
     elif sfm_stats["n_points"] < 1000:
@@ -487,10 +526,23 @@ def main() -> None:
 
     # ---- PLY export --------------------------------------------------------
     logger.info("\n=== Exporting point cloud ===")
-    cameras, images, points3d = read_model(sparse_0)
-    ply_path = output_dir / "points3D.ply"
-    write_ply(points3d, ply_path)
-    logger.info(f"PLY written: {ply_path}  ({len(points3d):,} points)")
+    cameras = read_cameras_binary(sparse_0 / "cameras.bin")
+    images = read_images_binary(sparse_0 / "images.bin")
+    if new_pts:
+        # Reuse the in-memory densified cloud instead of re-reading points3D.bin
+        # (which replace_points3d() just wrote from this same dict) — holding both
+        # the original and a freshly re-parsed copy at once is what pushed RAM to
+        # 96%+ around this stage on a large densified cloud.
+        points3d = new_pts
+        new_pts = None
+    else:
+        points3d = read_points3d_binary(sparse_0 / "points3D.bin")
+    if ply_already_exists:
+        stats["densified_points"] = len(points3d)
+        logger.info(f"PLY already exists: {ply_path}  ({len(points3d):,} points) — not rewriting")
+    else:
+        write_ply(points3d, ply_path)
+        logger.info(f"PLY written: {ply_path}  ({len(points3d):,} points)")
 
     # ---- 2DGS suggested training parameters (heuristic) --------------------
     gs_suggestion = gs_params.suggest_2dgs_params(images, points3d)
@@ -513,7 +565,7 @@ def main() -> None:
 
     # ---- Validation --------------------------------------------------------
     logger.info("\n=== Validation ===")
-    valid = validate_output(output_dir, logger)
+    valid = validate_output(output_dir, logger, images, len(points3d))
     print_summary(stats, output_dir, time.time() - t0, logger)
 
     # ---- Report ------------------------------------------------------------

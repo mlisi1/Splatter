@@ -66,6 +66,7 @@ def _section_summary(stats: dict) -> str:
         ("Frames registered",       f"{n_reg:,}  ({n_reg / n_dedup:.1%})"),
         ("Sparse points (SfM)",     f"{stats['sparse_points']:,}"),
         ("Georegistration",         stats.get("georegistration", "None")),
+        ("Up-axis aligned",         stats.get("up_axis_aligned", "No")),
         ("Densification branch",    stats["densification_branch"]),
         ("Densified points",        f"{stats['densified_points']:,}"),
         ("Mean reprojection error", f"{stats['mean_reproj']:.2f} px"),

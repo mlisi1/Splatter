@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from splatter.io.colmap import read_model
+from splatter.io.colmap import read_images_binary, read_points3d_stats
 
 logger = logging.getLogger("gs_init")
 
@@ -80,12 +80,11 @@ def check_quality(sparse_0: Path, total_images: int) -> dict:
 
     Returns a dict with keys: n_registered, n_points, reg_rate, mean_reproj.
     """
-    cameras, images, points3d = read_model(sparse_0)
+    images = read_images_binary(sparse_0 / "images.bin")
     n_reg = len(images)
-    n_pts = len(points3d)
+    n_pts, errors = read_points3d_stats(sparse_0 / "points3D.bin")
     reg_rate = n_reg / max(total_images, 1)
-    errors = [p.error for p in points3d.values() if p.error > 0]
-    mean_reproj = float(np.mean(errors)) if errors else 0.0
+    mean_reproj = float(np.mean(errors)) if len(errors) else 0.0
 
     logger.info(f"Registered: {n_reg}/{total_images} ({reg_rate:.1%})")
     logger.info(f"Sparse points: {n_pts:,}")
